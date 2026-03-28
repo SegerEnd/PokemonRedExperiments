@@ -16,7 +16,7 @@ except ImportError:
 
 class BestAgentViewer(BaseCallback):
 
-    def __init__(self, update_interval=12, ws_address="ws://localhost:8443/broadcast",
+    def __init__(self, update_interval=12, ws_address="ws://dev.segerend.nl:8443/broadcast",
                  user="anonymous", color="#ffffff", verbose=0):
         super().__init__(verbose)
         self.update_interval = update_interval

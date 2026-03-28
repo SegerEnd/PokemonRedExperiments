@@ -12,6 +12,9 @@ from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 from tensorboard_callback import TensorboardCallback
 from best_agent_viewer import BestAgentViewer
 
+USER = "Linux"
+COLOR = "#87CEFA"
+
 def make_env(rank, env_conf, seed=0):
     """
     Utility function for multiprocessed env.
@@ -24,9 +27,9 @@ def make_env(rank, env_conf, seed=0):
         env = StreamWrapper(
             RedGymEnv(env_conf),
             stream_metadata = { # All of this is part is optional
-                "user": "starstruck", # choose your own username
+                "user": USER, # choose your own username
                 "env_id": rank, # environment identifier
-                "color": "#ff1493", # choose your color :)
+                "color": COLOR, # choose your color :)
                 "extra": "", # any extra text you put here will be displayed
             }
         )
@@ -35,7 +38,15 @@ def make_env(rank, env_conf, seed=0):
     set_random_seed(seed)
     return _init
 
+def linear_schedule(initial_value):
+    def func(progress_remaining):
+        return progress_remaining * initial_value
+    return func
+
 if __name__ == "__main__":
+
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
 
     use_wandb_logging = False
     ep_length = 2048 * 80
@@ -58,7 +69,7 @@ if __name__ == "__main__":
     checkpoint_callback = CheckpointCallback(save_freq=ep_length//2, save_path=sess_path,
                                      name_prefix="poke")
 
-    callbacks = [checkpoint_callback, TensorboardCallback(sess_path), BestAgentViewer(user="starstruck", color="#ff1493")]
+    callbacks = [checkpoint_callback, TensorboardCallback(sess_path), BestAgentViewer(user=USER, color=COLOR)]
 
     if use_wandb_logging:
         import wandb

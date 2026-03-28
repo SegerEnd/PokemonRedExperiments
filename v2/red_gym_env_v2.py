@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-from skimage.transform import downscale_local_mean
 import matplotlib.pyplot as plt
 from pyboy import PyBoy
 #from pyboy.logger import log_level
@@ -134,6 +133,7 @@ class RedGymEnv(Env):
             #debugging=False,
             #disable_input=False,
             window=head,
+            sound_emulated=False,
         )
 
         #self.screen = self.pyboy.botsupport_manager().screen()
@@ -191,10 +191,13 @@ class RedGymEnv(Env):
         self.seen_coords = {}
 
     def render(self, reduce_res=True):
-        game_pixels_render = self.pyboy.screen.ndarray[:,:,0:1]  # (144, 160, 3)
+        game_pixels_render = self.pyboy.screen.ndarray[:,:,0:1]  # (144, 160, 1)
         if reduce_res:
+            # average 2x2 blocks (same as downscale_local_mean) to preserve detail
             game_pixels_render = (
-                downscale_local_mean(game_pixels_render, (2,2,1))
+                game_pixels_render
+                .reshape(72, 2, 80, 2, 1)
+                .mean(axis=(1, 3))
             ).astype(np.uint8)
         return game_pixels_render
 

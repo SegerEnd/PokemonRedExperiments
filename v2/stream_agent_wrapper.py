@@ -16,7 +16,7 @@ MAP_N_ADDRESS = 0xD35E
 class StreamWrapper(gym.Wrapper):
     def __init__(self, env, stream_metadata={}):
         super().__init__(env)
-        self.ws_address = "ws://localhost:8443/broadcast"
+        self.ws_address = "ws://dev.segerend.nl:8443/broadcast"
         self.stream_metadata = stream_metadata
         self.upload_interval = 30
         self.steam_step_counter = 0
