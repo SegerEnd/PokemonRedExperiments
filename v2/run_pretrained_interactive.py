@@ -1,92 +1,114 @@
 import os
-from os.path import exists
 from pathlib import Path
 import uuid
-import time
-import glob
+
 from red_gym_env_v2 import RedGymEnv
-from stable_baselines3 import A2C, PPO
-from stable_baselines3.common import env_checker
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.callbacks import CheckpointCallback
+from baseline_sample_factory import make_pokemon_env, register_pokemon_env
 
-def make_env(rank, env_conf, seed=0):
-    """
-    Utility function for multiprocessed env.
-    :param env_id: (str) the environment ID
-    :param num_env: (int) the number of environments you wish to have in subprocesses
-    :param seed: (int) the initial seed for RNG
-    :param rank: (int) index of the subprocess
-    """
-    def _init():
-        env = RedGymEnv(env_conf)
-        #env.seed(seed + rank)
-        return env
-    set_random_seed(seed)
-    return _init
+from sample_factory.cfg.arguments import parse_sf_args
+from sample_factory.algo.utils.make_env import make_env_func_batched
+from sample_factory.utils.attr_dict import AttrDict
+from sample_factory.algo.learning.learner import Learner
+from sample_factory.model.actor_critic import create_actor_critic
+from sample_factory.utils.utils import log
+from sample_factory.algo.utils.context import sf_global_context
 
-def get_most_recent_zip_with_age(folder_path):
-    # Get all zip files in the folder
-    zip_files = glob.glob(os.path.join(folder_path, "*.zip"))
-    
-    if not zip_files:
-        return None, None  # Return None if no zip files are found
-    
-    # Find the most recently modified zip file
-    most_recent_zip = max(zip_files, key=os.path.getmtime)
-    
-    # Calculate how old the file is in hours
-    current_time = time.time()
-    modification_time = os.path.getmtime(most_recent_zip)
-    age_in_hours = (current_time - modification_time) / 3600  # Convert seconds to hours
-    
-    return most_recent_zip, age_in_hours
+import torch
 
-if __name__ == '__main__':
 
-    sess_path = Path(f'session_{str(uuid.uuid4())[:8]}')
+def load_sf_model(train_dir, experiment):
+    """Load a Sample Factory checkpoint and return the actor-critic model."""
+    register_pokemon_env()
+
+    parser, cfg = parse_sf_args(argv=[
+        f"--env=pokemon_red",
+        f"--train_dir={train_dir}",
+        f"--experiment={experiment}",
+    ])
+
+    cfg.num_workers = 1
+    cfg.num_envs_per_worker = 1
+
+    # Find latest checkpoint
+    checkpoint_dir = Path(train_dir) / experiment
+    checkpoints = sorted(checkpoint_dir.glob("checkpoint_*"), key=os.path.getmtime)
+    if not checkpoints:
+        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+
+    latest = checkpoints[-1]
+    checkpoint_file = latest / "checkpoint.pth"
+    print(f"Loading checkpoint: {latest.name}")
+
+    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+
+    # Create env to get observation/action spaces
+    env_config = AttrDict(worker_index=0, vector_index=0)
+    env = make_pokemon_env("pokemon_red", cfg=cfg, env_config=env_config)
+    obs_space = env.observation_space
+    action_space = env.action_space
+    env.close()
+
+    # Build model and load weights
+    model = create_actor_critic(cfg, obs_space, action_space)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
+
+    return model
+
+
+if __name__ == "__main__":
+    sess_path = Path(f"session_{str(uuid.uuid4())[:8]}")
     ep_length = 2**23
 
     env_config = {
-                'headless': False, 'save_final_state': True, 'early_stop': False,
-                'action_freq': 24, 'init_state': '../init.state', 'max_steps': ep_length, 
-                'print_rewards': True, 'save_video': False, 'fast_video': True, 'session_path': sess_path,
-                'gb_path': '../PokemonRed.gb', 'debug': False, 'sim_frame_dist': 2_000_000.0, 'extra_buttons': False
-            }
-    
-    num_cpu = 1 #64 #46  # Also sets the number of episodes per training iteration
-    env = make_env(0, env_config)() #SubprocVecEnv([make_env(i, env_config) for i in range(num_cpu)])
-    
-    #env_checker.check_env(env)
-    most_recent_checkpoint, time_since = get_most_recent_zip_with_age("runs")
-    if most_recent_checkpoint is not None:
-        file_name = most_recent_checkpoint
-        print(f"using checkpoint: {file_name}, which is {time_since} hours old")
-    
-    # could optionally manually specify a checkpoint here
-    #file_name = "runs/poke_41943040_steps.zip"
-    print('\nloading checkpoint')
-    model = PPO.load(file_name, env=env, custom_objects={'lr_schedule': 0, 'clip_range': 0})
-        
-    #keyboard.on_press_key("M", toggle_agent)
+        "headless": False,
+        "save_final_state": True,
+        "early_stop": False,
+        "action_freq": 24,
+        "init_state": "../init.state",
+        "max_steps": ep_length,
+        "print_rewards": True,
+        "save_video": False,
+        "fast_video": True,
+        "session_path": sess_path,
+        "gb_path": "../PokemonRed.gb",
+        "debug": False,
+        "reward_scale": 0.5,
+        "explore_weight": 0.25,
+    }
+
+    env = RedGymEnv(env_config)
+    model = load_sf_model(train_dir="./runs_sf", experiment="poke_sf")
+
     obs, info = env.reset()
+    rnn_states = None
+
     while True:
         try:
             with open("agent_enabled.txt", "r") as f:
                 agent_enabled = f.readlines()[0].startswith("yes")
-        except:
+        except Exception:
             agent_enabled = False
+
         if agent_enabled:
-            action, _states = model.predict(obs, deterministic=False)
+            # Convert obs dict to tensors
+            obs_tensors = {
+                k: torch.from_numpy(v).unsqueeze(0).float()
+                for k, v in obs.items()
+            }
+            with torch.no_grad():
+                policy_output = model(obs_tensors, rnn_states)
+                action = policy_output["actions"].squeeze().item()
+                rnn_states = policy_output.get("new_rnn_states", None)
+
             obs, rewards, terminated, truncated, info = env.step(action)
         else:
             env.pyboy.tick(1, True)
             obs = env._get_obs()
             truncated = env.step_count >= env.max_steps - 1
+
         env.render()
         if truncated:
             break
+
     env.close()
-
-

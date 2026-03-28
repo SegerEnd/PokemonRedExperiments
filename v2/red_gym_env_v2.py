@@ -15,9 +15,29 @@ from pyboy.utils import WindowEvent
 
 from global_map import local_to_global, GLOBAL_MAP_SHAPE
 
+import math
+
 event_flags_start = 0xD747
-event_flags_end = 0xD87E # expand for SS Anne # old - 0xD7F6 
+event_flags_end = 0xD87E # expand for SS Anne # old - 0xD7F6
 museum_ticket = (0xD754, 0)
+
+# battle state addresses
+ENEMY_HP_ADDR = 0xCFE6       # 2 bytes big-endian
+ENEMY_MAX_HP_ADDR = 0xCFF4   # 2 bytes big-endian
+BATTLE_TYPE_ADDR = 0xD057    # 0 = not in battle
+
+# inventory
+NUM_BAG_ITEMS_ADDR = 0xD31D  # count of items in bag (max 20)
+MONEY_ADDR = (0xD347, 0xD348, 0xD349)  # BCD encoded
+
+# per-pokemon HP (2 bytes each, big-endian)
+PARTY_HP_ADDRS = [0xD16C, 0xD198, 0xD1C4, 0xD1F0, 0xD21C, 0xD248]
+PARTY_MAX_HP_ADDRS = [0xD18D, 0xD1B9, 0xD1E5, 0xD211, 0xD23D, 0xD269]
+
+# status conditions & move PP
+PLAYER_STATUS_ADDR = 0xD018    # active pokemon status (poison/burn/freeze/paralyze/sleep)
+ENEMY_STATUS_ADDR = 0xCFE9     # enemy status condition
+PLAYER_PP_ADDRS = [0xD02D, 0xD02E, 0xD02F, 0xD030]  # PP for moves 1-4
 
 class RedGymEnv(Env):
     def __init__(self, config=None):
@@ -30,7 +50,7 @@ class RedGymEnv(Env):
         self.max_steps = config["max_steps"]
         self.save_video = config["save_video"]
         self.fast_video = config["fast_video"]
-        self.frame_stacks = 3
+        self.frame_stacks = 4
         self.explore_weight = (
             1 if "explore_weight" not in config else config["explore_weight"]
         )
@@ -101,7 +121,8 @@ class RedGymEnv(Env):
                 "events": spaces.MultiBinary((event_flags_end - event_flags_start) * 8),
                 "map": spaces.Box(low=0, high=255, shape=(
                     self.coords_pad*4,self.coords_pad*4, 1), dtype=np.uint8),
-                "recent_actions": spaces.MultiDiscrete([len(self.valid_actions)] * self.frame_stacks)
+                "recent_actions": spaces.MultiDiscrete([len(self.valid_actions)] * self.frame_stacks),
+                "battle_info": spaces.Box(low=0, high=1, shape=(18,)),  # in_battle(1) + party_hp(6) + enemy_hp(1) + money(1) + bag_items(1) + player_status(1) + enemy_status(1) + move_pp(4) + is_wild(1) + is_trainer(1)
             }
         )
 
@@ -147,6 +168,8 @@ class RedGymEnv(Env):
         self.died_count = 0
         self.party_size = 0
         self.step_count = 0
+        self.opponent_kos = 0
+        self.last_enemy_hp_raw = 0
 
         self.base_event_flags = sum([
                 self.bit_count(self.read_m(i))
@@ -174,6 +197,9 @@ class RedGymEnv(Env):
                 downscale_local_mean(game_pixels_render, (2,2,1))
             ).astype(np.uint8)
         return game_pixels_render
+
+    def render_full(self):
+        return self.pyboy.screen.ndarray[:,:,0]
     
     def _get_obs(self):
         
@@ -193,7 +219,19 @@ class RedGymEnv(Env):
             "badges": np.array([int(bit) for bit in f"{self.read_m(0xD356):08b}"], dtype=np.int8),
             "events": np.array(self.read_event_bits(), dtype=np.int8),
             "map": self.get_explore_map()[:, :, None],
-            "recent_actions": self.recent_actions
+            "recent_actions": self.recent_actions,
+            "battle_info": np.concatenate([
+                [float(self.is_in_battle())],
+                self.read_party_hp_fractions(),
+                [self.read_enemy_hp_fraction()],
+                [self.read_money()],
+                [self.read_bag_item_count()],
+                [self.read_status_normalized(PLAYER_STATUS_ADDR)],
+                [self.read_status_normalized(ENEMY_STATUS_ADDR)],
+                self.read_move_pp_normalized(),
+                [float(self.read_m(BATTLE_TYPE_ADDR) == 1)],  # wild battle
+                [float(self.read_m(BATTLE_TYPE_ADDR) == 2)],  # trainer battle
+            ]).astype(np.float32),
         }
 
         return observation
@@ -213,6 +251,7 @@ class RedGymEnv(Env):
         self.update_explore_map()
 
         self.update_heal_reward()
+        self.update_battle_kos()
 
         self.party_size = self.read_m(0xD163)
 
@@ -229,13 +268,12 @@ class RedGymEnv(Env):
         # self.save_and_print_info(step_limit_reached, obs)
 
         # create a map of all event flags set, with names where possible
-        #if step_limit_reached:
-        if self.step_count % 100 == 0:
+        # only at episode end to avoid per-step overhead
+        if step_limit_reached:
             for address in range(event_flags_start, event_flags_end):
                 val = self.read_m(address)
                 for idx, bit in enumerate(f"{val:08b}"):
                     if bit == "1":
-                        # TODO this currently seems to be broken!
                         key = f"0x{address:X}-{idx}"
                         if key in self.event_names.keys():
                             self.current_event_flags_set[key] = self.event_names[key]
@@ -343,7 +381,6 @@ class RedGymEnv(Env):
                 self.seen_coords[coord_string] += 1
             else:
                 self.seen_coords[coord_string] = 1
-            #self.seen_coords[coord_string] = self.step_count
 
     def get_current_coord_count_reward(self):
         x_pos, y_pos, map_n = self.get_game_coords()
@@ -352,7 +389,10 @@ class RedGymEnv(Env):
             count = self.seen_coords[coord_string]
         else:
             count = 0
-        return 0 if count < 600 else 1
+        # graduated penalty: ramps from 0 at 200 visits to max of 3.0
+        if count < 200:
+            return 0
+        return min((count - 200) / 600.0, 3.0)
 
     def get_global_coords(self):
         x_pos, y_pos, map_n = self.get_game_coords()
@@ -405,9 +445,14 @@ class RedGymEnv(Env):
             prog["explore"] * 150 / (self.explore_weight * self.reward_scale),
         )
 
+    def get_effective_max_steps(self):
+        # curriculum: ramp episode length from 25% to 100% over first 50 resets
+        progress = min(self.reset_count / 50, 1.0)
+        min_steps = self.max_steps // 4
+        return int(min_steps + (self.max_steps - min_steps) * progress)
+
     def check_if_done(self):
-        done = self.step_count >= self.max_steps - 1
-        # done = self.read_hp_fraction() == 0 # end game on loss
+        done = self.step_count >= self.get_effective_max_steps() - 1
         return done
 
     def save_and_print_info(self, done, obs):
@@ -481,12 +526,14 @@ class RedGymEnv(Env):
 
     def get_levels_reward(self):
         explore_thresh = 22
-        scale_factor = 4
         level_sum = self.get_levels_sum()
-        if level_sum < explore_thresh:
+        if level_sum <= explore_thresh:
             scaled = level_sum
         else:
-            scaled = (level_sum - explore_thresh) / scale_factor + explore_thresh
+            # smooth diminishing returns above threshold
+            # still rewards leveling but with decreasing marginal value
+            over = level_sum - explore_thresh
+            scaled = explore_thresh + 40 * (over / (over + 40))
         self.max_level_rew = max(self.max_level_rew, scaled)
         return self.max_level_rew
 
@@ -514,15 +561,18 @@ class RedGymEnv(Env):
     def get_game_state_reward(self, print_stats=False):
         # addresses from https://datacrystal.romhacking.net/wiki/Pok%C3%A9mon_Red/Blue:RAM_map
         # https://github.com/pret/pokered/blob/91dc3c9f9c8fd529bb6e8307b58b96efa0bec67e/constants/event_constants.asm
+        badges = self.get_badges()
         state_scores = {
             "event": self.reward_scale * self.update_max_event_rew() * 4,
-            #"level": self.reward_scale * self.get_levels_reward(),
-            "heal": self.reward_scale * self.total_healing_rew * 10,
-            #"op_lvl": self.reward_scale * self.update_max_op_level() * 0.2,
-            #"dead": self.reward_scale * self.died_count * -0.1,
-            "badge": self.reward_scale * self.get_badges() * 10,
-            "explore": self.reward_scale * self.explore_weight * len(self.seen_coords) * 0.1,
-            "stuck": self.reward_scale * self.get_current_coord_count_reward() * -0.05
+            "level": self.reward_scale * self.get_levels_reward(),
+            "heal": self.reward_scale * min(self.total_healing_rew, 4) * 10,
+            "op_lvl": self.reward_scale * self.update_max_op_level() * 0.2,
+            "dead": self.reward_scale * self.died_count * -0.1 * (1 + badges * 0.3),
+            "badge": self.reward_scale * (2 ** badges + badges * 5),
+            "battle": self.reward_scale * self.opponent_kos * 0.5,
+            "map_progress": self.reward_scale * self.max_map_progress * 5,
+            "explore": self.reward_scale * self.explore_weight * math.sqrt(len(self.seen_coords)) * 1.0,
+            "stuck": self.reward_scale * self.get_current_coord_count_reward() * -0.1
         }
 
         return state_scores
@@ -543,6 +593,15 @@ class RedGymEnv(Env):
         cur_rew = self.get_all_events_reward()
         self.max_event_rew = max(cur_rew, self.max_event_rew)
         return self.max_event_rew
+
+    def update_battle_kos(self):
+        if self.is_in_battle():
+            enemy_hp = self.read_hp(ENEMY_HP_ADDR)
+            if self.last_enemy_hp_raw > 0 and enemy_hp == 0:
+                self.opponent_kos += 1
+            self.last_enemy_hp_raw = enemy_hp
+        else:
+            self.last_enemy_hp_raw = 0
 
     def update_heal_reward(self):
         cur_health = self.read_hp_fraction()
@@ -568,6 +627,50 @@ class RedGymEnv(Env):
 
     def read_hp(self, start):
         return 256 * self.read_m(start) + self.read_m(start + 1)
+
+    def is_in_battle(self):
+        return self.read_m(BATTLE_TYPE_ADDR) != 0
+
+    def read_party_hp_fractions(self):
+        """Per-pokemon HP fractions, 0 for empty slots."""
+        fracs = np.zeros(6, dtype=np.float32)
+        party_size = self.read_m(0xD163)
+        for i in range(min(party_size, 6)):
+            cur = self.read_hp(PARTY_HP_ADDRS[i])
+            mx = max(self.read_hp(PARTY_MAX_HP_ADDRS[i]), 1)
+            fracs[i] = cur / mx
+        return fracs
+
+    def read_enemy_hp_fraction(self):
+        if not self.is_in_battle():
+            return 0.0
+        cur = self.read_hp(ENEMY_HP_ADDR)
+        mx = max(self.read_hp(ENEMY_MAX_HP_ADDR), 1)
+        return cur / mx
+
+    def read_money(self):
+        """Read BCD-encoded money, normalized to [0, 1]."""
+        raw = 0
+        for addr in MONEY_ADDR:
+            byte = self.read_m(addr)
+            raw = raw * 100 + 10 * ((byte >> 4) & 0x0F) + (byte & 0x0F)
+        return min(raw / 999999.0, 1.0)
+
+    def read_bag_item_count(self):
+        """Number of distinct items in bag, normalized to [0, 1]."""
+        return min(self.read_m(NUM_BAG_ITEMS_ADDR) / 20.0, 1.0)
+
+    def read_status_normalized(self, addr):
+        """Status byte: 0=healthy, nonzero=afflicted. Return 1 if any status, 0 if healthy."""
+        return float(self.read_m(addr) != 0)
+
+    def read_move_pp_normalized(self):
+        """PP for active pokemon's 4 moves, normalized to [0, 1]. Max PP in gen1 is 40."""
+        if not self.is_in_battle():
+            return np.zeros(4, dtype=np.float32)
+        return np.array([
+            min(self.read_m(addr) / 40.0, 1.0) for addr in PLAYER_PP_ADDRS
+        ], dtype=np.float32)
 
     # built-in since python 3.10
     def bit_count(self, bits):

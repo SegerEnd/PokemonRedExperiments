@@ -1,8 +1,14 @@
 import asyncio
-import websockets
+import threading
+import queue
 import json
 
 import gymnasium as gym
+
+try:
+    import websockets
+except ImportError:
+    websockets = None
 
 X_POS_ADDRESS, Y_POS_ADDRESS = 0xD362, 0xD361
 MAP_N_ADDRESS = 0xD35E
@@ -10,15 +16,9 @@ MAP_N_ADDRESS = 0xD35E
 class StreamWrapper(gym.Wrapper):
     def __init__(self, env, stream_metadata={}):
         super().__init__(env)
-        self.ws_address = "wss://transdimensional.xyz/broadcast"
+        self.ws_address = "ws://localhost:8443/broadcast"
         self.stream_metadata = stream_metadata
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.websocket = None
-        self.loop.run_until_complete(
-            self.establish_wc_connection()
-        )
-        self.upload_interval = 300
+        self.upload_interval = 30
         self.steam_step_counter = 0
         self.env = env
         self.coord_list = []
@@ -29,7 +29,34 @@ class StreamWrapper(gym.Wrapper):
         else:
             raise Exception("Could not find emulator!")
 
+        # Non-blocking send queue + background thread
+        self._send_queue = queue.Queue(maxsize=200)
+        if websockets is not None:
+            self._ws_thread = threading.Thread(target=self._send_loop, daemon=True)
+            self._ws_thread.start()
+
+    def _send_loop(self):
+        loop = asyncio.new_event_loop()
+        ws = None
+        while True:
+            msg = self._send_queue.get()
+            try:
+                if ws is None:
+                    ws = loop.run_until_complete(
+                        websockets.connect(self.ws_address)
+                    )
+                loop.run_until_complete(ws.send(msg))
+            except Exception:
+                ws = None
+                # drain stale messages so we send fresh data on reconnect
+                while not self._send_queue.empty():
+                    try:
+                        self._send_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
     def step(self, action):
+        result = self.env.step(action)
 
         x_pos = self.emulator.memory[X_POS_ADDRESS]
         y_pos = self.emulator.memory[Y_POS_ADDRESS]
@@ -38,34 +65,16 @@ class StreamWrapper(gym.Wrapper):
 
         if self.steam_step_counter >= self.upload_interval:
             self.stream_metadata["extra"] = f"coords: {len(self.env.seen_coords)}"
-            self.loop.run_until_complete(
-                self.broadcast_ws_message(
-                    json.dumps(
-                        {
-                          "metadata": self.stream_metadata,
-                          "coords": self.coord_list
-                        }
-                    )
-                )
-            )
+            msg = json.dumps({
+                "metadata": self.stream_metadata,
+                "coords": self.coord_list,
+            })
+            try:
+                self._send_queue.put_nowait(msg)
+            except queue.Full:
+                pass  # drop message if behind
             self.steam_step_counter = 0
             self.coord_list = []
 
         self.steam_step_counter += 1
-
-        return self.env.step(action)
-
-    async def broadcast_ws_message(self, message):
-        if self.websocket is None:
-            await self.establish_wc_connection()
-        if self.websocket is not None:
-            try:
-                await self.websocket.send(message)
-            except websockets.exceptions.WebSocketException as e:
-                self.websocket = None
-
-    async def establish_wc_connection(self):
-        try:
-            self.websocket = await websockets.connect(self.ws_address)
-        except:
-            self.websocket = None
+        return result
